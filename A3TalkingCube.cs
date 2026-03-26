@@ -1,16 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
-using System.IO;
 using System.Threading.Tasks;
-using Utilities.Encoding.Wav;     // important
 using OpenAI;
 using OpenAI.Audio;
 using OpenAI.Chat;
 using UnityEngine;
 
 /// <summary>
-/// Talking Cube — Speech → Text → GPT → TTS pipeline using Azure OpenAI.
+/// Talking Cube — Speech → Text → GPT → TTS pipeline using the OpenAI API.
 ///
 /// Call BeginListening() on button-down and StopListening() on button-up.
 ///
@@ -22,15 +20,20 @@ using UnityEngine;
 /// </summary>
 public class A3TalkingCube : MonoBehaviour
 {
-    [SerializeField] private string azureResourceName = "";
-    [SerializeField] private string azureApiKey = "apikey.txt";
-    [SerializeField] private string azureApiVersion = "2024-10-21";
+    [Header("Camera")]
+    [SerializeField] private A4CameraFrameProvider cameraFrameProvider;
 
-    [Header("Azure — deployments")]
-    [SerializeField] private string chatDeployment = "gpt-5-chat";
-    [SerializeField] private string sttDeployment = "gpt-4o-mini-transcribe";
-    [SerializeField] private string ttsDeployment = "gpt-4o-mini-tts";
-    [SerializeField] private string systemPrompt = "You are a friendly talking cube. Keep answers short.";
+    [Header("OpenAI")]
+    [SerializeField] private OpenAIConfiguration configuration;
+    [SerializeField] private string openAIApiKey = "apikey.txt";
+
+    [Header("OpenAI Models")]
+    [SerializeField] private string chatModel = "gpt-5-mini";
+    [SerializeField] private string sttModel = "gpt-4o-mini-transcribe";
+    [SerializeField] private string ttsModel = "gpt-4o-mini-tts";
+    [SerializeField] private Voice ttsVoice = Voice.Alloy;
+    [SerializeField] private string transcriptionLanguage = "zh";
+    [SerializeField] private string systemPrompt = "You are a friendly talking cube with eyes. You can see what the user sees through their headset camera. When the user asks about something in their view, describe what you see. Keep answers short.";
 
     [Header("Recording")]
     [SerializeField] private int maxRecordingSeconds = 15;
@@ -46,10 +49,8 @@ public class A3TalkingCube : MonoBehaviour
     private enum State { Idle, Recording, Processing, Speaking }
     private State currentState = State.Idle;
 
-    // ── One client per deployment ────────────────────────────────────────────
-    private OpenAIClient sttClient;
-    private OpenAIClient chatClient;
-    private OpenAIClient ttsClient;
+    // ── OpenAI client ────────────────────────────────────────────────────────
+    private OpenAIClient openAIClient;
 
     // ── Components ───────────────────────────────────────────────────────────
     private AudioSource audioSource;
@@ -66,13 +67,15 @@ public class A3TalkingCube : MonoBehaviour
 
     void Start()
     {
-        var domain = "cognitiveservices.azure.com";
-        var auth = new OpenAIAuthentication(azureApiKey);
+        var auth = ResolveAuthentication();
+        if (auth == null)
+        {
+            Debug.LogError("[TalkingCube] Missing OpenAI API credentials. Set openAIApiKey, or provide a non-Azure OpenAIConfiguration, or define OPENAI_API_KEY.");
+            enabled = false;
+            return;
+        }
 
-        // Clients are already set up for you (do not change unless instructed).
-        sttClient = new OpenAIClient(auth, new OpenAISettings(azureResourceName, sttDeployment, azureApiVersion, azureDomain: domain));
-        chatClient = new OpenAIClient(auth, new OpenAISettings(azureResourceName, chatDeployment, azureApiVersion, azureDomain: domain));
-        ttsClient = new OpenAIClient(auth, new OpenAISettings(azureResourceName, ttsDeployment, azureApiVersion, azureDomain: domain));
+        openAIClient = new OpenAIClient(auth, new OpenAISettings());
 
         // Unity components
         audioSource = gameObject.AddComponent<AudioSource>();
@@ -85,9 +88,30 @@ public class A3TalkingCube : MonoBehaviour
             Debug.LogWarning("[TalkingCube] No microphone found.");
 
         history.Add(new Message(Role.System, systemPrompt));
-
-        // TODO (Part A): ensure the cube starts in the correct color.
         ApplyColor();
+    }
+
+    OpenAIAuthentication ResolveAuthentication()
+    {
+        if (!string.IsNullOrWhiteSpace(openAIApiKey))
+        {
+            return new OpenAIAuthentication(openAIApiKey.Trim());
+        }
+
+        if (configuration != null)
+        {
+            if (configuration.UseAzureOpenAI)
+            {
+                Debug.LogWarning("[TalkingCube] Assigned OpenAIConfiguration is set to Azure OpenAI. Ignoring it for the standard OpenAI API flow.");
+            }
+            else
+            {
+                return new OpenAIAuthentication(configuration);
+            }
+        }
+
+        return new OpenAIAuthentication().LoadFromEnvironment()
+               ?? new OpenAIAuthentication().LoadFromDirectory();
     }
 
     /// <summary>Call this when the user presses the button.</summary>
@@ -119,9 +143,10 @@ public class A3TalkingCube : MonoBehaviour
             return;
         }
 
-        // Processing state should show yellow
         SetState(State.Processing);
 
+        cts?.Cancel();
+        cts?.Dispose();
         cts = new CancellationTokenSource();
         _ = RunPipelineAsync(recordingClip, cts.Token);
     }
@@ -131,79 +156,84 @@ public class A3TalkingCube : MonoBehaviour
     {
         try
         {
-            // TODO (Part B.1): Speech → Text
-            var wavBytes = clip.EncodeToWav(outputSampleRate: clip.frequency); // match header + data
-            using var wavStream = new MemoryStream(wavBytes);
+            var sttRequest = new AudioTranscriptionRequest(
+                clip,
+                model: sttModel,
+                language: string.IsNullOrWhiteSpace(transcriptionLanguage) ? null : transcriptionLanguage.Trim(),
+                temperature: 0.1f);
 
-            // - Create an AudioTranscriptionRequest
-            var sttRequest = new AudioTranscriptionRequest(wavStream, "recording.wav");
+            string userText = (await openAIClient.AudioEndpoint.CreateTranscriptionTextAsync(sttRequest, token))?.Trim();
 
-            // - Call sttClient.AudioEndpoint.CreateTranscriptionTextAsync(...)
-            // - Store result in: string userText
-            string userText = await sttClient.AudioEndpoint.CreateTranscriptionTextAsync(sttRequest, token);
+            Texture2D snapshot = null;
+            if (cameraFrameProvider != null)
+            {
+                snapshot = await cameraFrameProvider.CaptureFrameAsync();
+            }
 
-            // TODO: If userText is empty/whitespace:
-            // - Log "No speech detected."
-            // - SetState(State.Idle)
-            // - return
             if (string.IsNullOrWhiteSpace(userText))
             {
-                // - Log "No speech detected."
                 Debug.Log("[TalkingCube] No speech detected.");
-                // - SetState(State.Idle)
                 SetState(State.Idle);
-                // - return
                 return;
             }
 
-            // TODO (Part B.2): Text → GPT
-            // - add message to history
+            // Always store text-only in history to avoid sending images repeatedly
             history.Add(new Message(Role.User, userText));
 
-            // - Create ChatRequest(history, chatDeployment)
-            var chatRequest = new ChatRequest(history, model: chatDeployment);
+            // Build the request messages: use history as-is for all past turns,
+            // but replace the last message with a multimodal version if we have a snapshot
+            var requestMessages = new List<Message>(history);
+            if (snapshot != null)
+            {
+                requestMessages.RemoveAt(requestMessages.Count - 1);
+                requestMessages.Add(new Message(Role.User, new List<Content>
+                {
+                    new Content(snapshot),
+                    new Content(userText)
+                }));
+            }
+            var chatRequest = new ChatRequest(requestMessages, chatModel);
+            var chatResponse = await openAIClient.ChatEndpoint.GetCompletionAsync(chatRequest, token);
+            string reply = chatResponse.FirstChoice.Message?.ToString().Trim();
 
-            // - Call chatClient.ChatEndpoint.GetCompletionAsync(...)
-            var chatResponse = await chatClient.ChatEndpoint.GetCompletionAsync(chatRequest, token);
+            if (string.IsNullOrWhiteSpace(reply))
+            {
+                Debug.LogWarning("[TalkingCube] OpenAI returned an empty reply.");
+                SetState(State.Idle);
+                return;
+            }
 
-            // - Extract reply string
-            // - history.Add(new Message(Role.Assistant, reply));
-            string reply = chatResponse.FirstChoice.Message;
             history.Add(new Message(Role.Assistant, reply));
 
-            // TODO (Part B.3): Text → Speech
-            // - Create SpeechRequest(reply)
-            var ttsRequest = new SpeechRequest(reply, model: ttsDeployment);
+            var ttsRequest = new SpeechRequest(
+                reply,
+                model: ttsModel,
+                voice: ttsVoice,
+                responseFormat: SpeechResponseFormat.PCM);
 
-            // - Call ttsClient.AudioEndpoint.GetSpeechAsync(...)
-            var ttsResponse = await ttsClient.AudioEndpoint.GetSpeechAsync(ttsRequest, cancellationToken: token);
-
-            // - Store in AudioClip speechClip
+            var ttsResponse = await openAIClient.AudioEndpoint.GetSpeechAsync(ttsRequest, cancellationToken: token);
             AudioClip speechClip = ttsResponse.AudioClip;
 
-            // TODO (Part B.4): Play + state transitions
-            // - SetState(State.Speaking)
+            if (speechClip == null)
+            {
+                Debug.LogWarning("[TalkingCube] Failed to generate speech audio.");
+                SetState(State.Idle);
+                return;
+            }
+
             SetState(State.Speaking);
-
-            // - audioSource.PlayOneShot(speechClip)
             audioSource.PlayOneShot(speechClip);
-
-            // - await Task.Delay( lengthInMs + smallPadding, token )
             int lengthInMs = (int)(speechClip.length * 1000);
             await Task.Delay(lengthInMs + 500, token);
-
-            // - SetState(State.Idle)
             SetState(State.Idle);
         }
         catch (OperationCanceledException)
         {
-            // TODO: Return to Idle if canceled
             SetState(State.Idle);
         }
         catch (Exception ex)
         {
             Debug.LogError($"[TalkingCube] Error: {ex.Message}");
-            // TODO: Return to Idle on error
             SetState(State.Idle);
         }
     }
@@ -211,24 +241,14 @@ public class A3TalkingCube : MonoBehaviour
     // ── State + Visual Feedback (Part A) ──────────────────────────────────────
     void SetState(State newState)
     {
-        // TODO (Part A.1):
-        // - Update currentState
         currentState = newState;
-        // - Call ApplyColor()
         ApplyColor();
     }
 
     void ApplyColor()
     {
-        // TODO (Part A.2):
-        // - If cubeRenderer is null, return
         if (cubeRenderer == null) return;
-        // - Pick the correct Color based on currentState:
-        //     Idle       -> idleColor
-        //     Recording  -> recordingColor
-        //     Processing -> processingColor
-        //     Speaking   -> speakingColor
-        //
+
         Color targetColor = currentState switch
         {
             State.Recording => recordingColor,
@@ -236,8 +256,7 @@ public class A3TalkingCube : MonoBehaviour
             State.Speaking => speakingColor,
             _ => idleColor
         };
-        // - Use MaterialPropertyBlock to set "_BaseColor"
-        //   (GetPropertyBlock, SetColor, SetPropertyBlock)
+
         cubeRenderer.GetPropertyBlock(propBlock);
         propBlock.SetColor("_BaseColor", targetColor);
         cubeRenderer.SetPropertyBlock(propBlock);

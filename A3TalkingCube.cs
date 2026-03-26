@@ -20,24 +20,27 @@ using UnityEngine;
 /// </summary>
 public class A3TalkingCube : MonoBehaviour
 {
+    [SerializeField] private AudioSource outputAudioSource;
+
     [Header("Camera")]
     [SerializeField] private A4CameraFrameProvider cameraFrameProvider;
 
     [Header("OpenAI")]
     [SerializeField] private OpenAIConfiguration configuration;
-    [SerializeField] private string openAIApiKey = "apikey.txt";
+    [SerializeField] private string openAIApiKey = string.Empty;
 
     [Header("OpenAI Models")]
     [SerializeField] private string chatModel = "gpt-5-mini";
     [SerializeField] private string sttModel = "gpt-4o-mini-transcribe";
     [SerializeField] private string ttsModel = "gpt-4o-mini-tts";
     [SerializeField] private Voice ttsVoice = Voice.Alloy;
-    [SerializeField] private string transcriptionLanguage = "zh";
-    [SerializeField] private string systemPrompt = "You are a friendly talking cube with eyes. You can see what the user sees through their headset camera. When the user asks about something in their view, describe what you see. Keep answers short.";
+    [SerializeField] private string transcriptionLanguage = "en";
+    [SerializeField] private string transcriptionPrompt = "Transcribe spoken English accurately. Do not translate. Prefer the most likely English words even if the audio is slightly unclear.";
+    [SerializeField] private string systemPrompt = "You are a friendly talking cube with eyes. You can see what the user sees through their headset camera. When the user asks about something in their view, describe what you see. Always reply in short English sentences.";
 
     [Header("Recording")]
     [SerializeField] private int maxRecordingSeconds = 15;
-    [SerializeField] private int sampleRate = 16000;
+    [SerializeField] private int sampleRate = 44100;
 
     [Header("Visual Feedback")]
     [SerializeField] private Color idleColor = Color.white;
@@ -67,18 +70,14 @@ public class A3TalkingCube : MonoBehaviour
 
     void Start()
     {
-        var auth = ResolveAuthentication();
-        if (auth == null)
+        if (!EnsureOpenAIClient())
         {
-            Debug.LogError("[TalkingCube] Missing OpenAI API credentials. Set openAIApiKey, or provide a non-Azure OpenAIConfiguration, or define OPENAI_API_KEY.");
             enabled = false;
             return;
         }
 
-        openAIClient = new OpenAIClient(auth, new OpenAISettings());
+        EnsureAudioSource();
 
-        // Unity components
-        audioSource = gameObject.AddComponent<AudioSource>();
         cubeRenderer = GetComponent<Renderer>();
         propBlock = new MaterialPropertyBlock();
 
@@ -87,7 +86,7 @@ public class A3TalkingCube : MonoBehaviour
         else
             Debug.LogWarning("[TalkingCube] No microphone found.");
 
-        history.Add(new Message(Role.System, systemPrompt));
+        ResetConversationHistory();
         ApplyColor();
     }
 
@@ -114,6 +113,59 @@ public class A3TalkingCube : MonoBehaviour
                ?? new OpenAIAuthentication().LoadFromDirectory();
     }
 
+    bool EnsureOpenAIClient()
+    {
+        if (openAIClient != null)
+        {
+            return true;
+        }
+
+        var auth = ResolveAuthentication();
+        if (auth == null)
+        {
+            Debug.LogError("[TalkingCube] Missing OpenAI API credentials. Set openAIApiKey, or provide a non-Azure OpenAIConfiguration, or define OPENAI_API_KEY.");
+            return false;
+        }
+
+        openAIClient = new OpenAIClient(auth, new OpenAISettings());
+        return true;
+    }
+
+    bool EnsureAudioSource()
+    {
+        if (audioSource == null)
+        {
+            audioSource = outputAudioSource != null
+                ? outputAudioSource
+                : GetComponent<AudioSource>();
+        }
+
+        if (audioSource == null)
+        {
+            audioSource = gameObject.AddComponent<AudioSource>();
+        }
+
+        if (audioSource == null)
+        {
+            Debug.LogError("[TalkingCube] Failed to resolve or create an AudioSource.");
+            return false;
+        }
+
+        audioSource.playOnAwake = false;
+        audioSource.loop = false;
+        audioSource.volume = 1f;
+        audioSource.spatialBlend = 0f;
+        audioSource.dopplerLevel = 0f;
+        audioSource.mute = false;
+        return true;
+    }
+
+    void ResetConversationHistory()
+    {
+        history.Clear();
+        history.Add(new Message(Role.System, systemPrompt));
+    }
+
     /// <summary>Call this when the user presses the button.</summary>
     [ContextMenu("Begin Listening")]
     public void BeginListening()
@@ -131,7 +183,13 @@ public class A3TalkingCube : MonoBehaviour
     public void StopListening()
     {
         if (currentState != State.Recording) return;
-        if (!Microphone.IsRecording(micDevice)) return;
+
+        if (!Microphone.IsRecording(micDevice))
+        {
+            Debug.LogWarning("[TalkingCube] Microphone stopped before release. Resetting to idle.");
+            SetState(State.Idle);
+            return;
+        }
 
         int capturedSamples = Microphone.GetPosition(micDevice);
         Microphone.End(micDevice);
@@ -148,7 +206,7 @@ public class A3TalkingCube : MonoBehaviour
         cts?.Cancel();
         cts?.Dispose();
         cts = new CancellationTokenSource();
-        _ = RunPipelineAsync(recordingClip, cts.Token);
+        _ = RunPipelineAsync(CreateTrimmedClip(recordingClip, capturedSamples), cts.Token);
     }
 
     // ── Pipeline (Part B) ─────────────────────────────────────────────────────
@@ -156,10 +214,17 @@ public class A3TalkingCube : MonoBehaviour
     {
         try
         {
-            var sttRequest = new AudioTranscriptionRequest(
+            if (!EnsureOpenAIClient())
+            {
+                SetState(State.Idle);
+                return;
+            }
+
+            using var sttRequest = new AudioTranscriptionRequest(
                 clip,
                 model: sttModel,
                 language: string.IsNullOrWhiteSpace(transcriptionLanguage) ? null : transcriptionLanguage.Trim(),
+                prompt: string.IsNullOrWhiteSpace(transcriptionPrompt) ? null : transcriptionPrompt.Trim(),
                 temperature: 0.1f);
 
             string userText = (await openAIClient.AudioEndpoint.CreateTranscriptionTextAsync(sttRequest, token))?.Trim();
@@ -177,7 +242,8 @@ public class A3TalkingCube : MonoBehaviour
                 return;
             }
 
-            // Always store text-only in history to avoid sending images repeatedly
+            // Reset history every turn so stale language context never leaks across requests.
+            ResetConversationHistory();
             history.Add(new Message(Role.User, userText));
 
             // Build the request messages: use history as-is for all past turns,
@@ -211,8 +277,8 @@ public class A3TalkingCube : MonoBehaviour
                 voice: ttsVoice,
                 responseFormat: SpeechResponseFormat.PCM);
 
-            var ttsResponse = await openAIClient.AudioEndpoint.GetSpeechAsync(ttsRequest, cancellationToken: token);
-            AudioClip speechClip = ttsResponse.AudioClip;
+            using var ttsResponse = await openAIClient.AudioEndpoint.GetSpeechAsync(ttsRequest, cancellationToken: token);
+            AudioClip speechClip = CreateClipFromPcm(ttsResponse);
 
             if (speechClip == null)
             {
@@ -222,20 +288,99 @@ public class A3TalkingCube : MonoBehaviour
             }
 
             SetState(State.Speaking);
-            audioSource.PlayOneShot(speechClip);
+            Debug.Log($"[TalkingCube] TTS clip ready. length={speechClip.length:F2}s samples={speechClip.samples} channels={speechClip.channels} frequency={speechClip.frequency}Hz");
+            if (!EnsureAudioSource())
+            {
+                SetState(State.Idle);
+                return;
+            }
+            audioSource.Stop();
+            audioSource.clip = speechClip;
+            audioSource.time = 0f;
+            audioSource.Play();
             int lengthInMs = (int)(speechClip.length * 1000);
             await Task.Delay(lengthInMs + 500, token);
             SetState(State.Idle);
         }
         catch (OperationCanceledException)
         {
-            SetState(State.Idle);
+            if (this != null)
+            {
+                SetState(State.Idle);
+            }
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[TalkingCube] Error: {ex.Message}");
-            SetState(State.Idle);
+            Debug.LogError($"[TalkingCube] Error: {ex}");
+            if (this != null)
+            {
+                SetState(State.Idle);
+            }
         }
+        finally
+        {
+            if (clip != null && clip != recordingClip)
+            {
+                Destroy(clip);
+            }
+        }
+    }
+
+    AudioClip CreateTrimmedClip(AudioClip sourceClip, int capturedSamples)
+    {
+        if (sourceClip == null)
+        {
+            return null;
+        }
+
+        int sampleCount = Mathf.Clamp(capturedSamples, 0, sourceClip.samples);
+        if (sampleCount <= 0 || sampleCount == sourceClip.samples)
+        {
+            return sourceClip;
+        }
+
+        float[] samples = new float[sampleCount * sourceClip.channels];
+        sourceClip.GetData(samples, 0);
+
+        var trimmedClip = AudioClip.Create(
+            $"{sourceClip.name}_trimmed",
+            sampleCount,
+            sourceClip.channels,
+            sourceClip.frequency,
+            false);
+        trimmedClip.SetData(samples, 0);
+        return trimmedClip;
+    }
+
+    AudioClip CreateClipFromPcm(SpeechClip speech)
+    {
+        if (speech == null)
+        {
+            Debug.LogWarning("[TalkingCube] Speech response was null.");
+            return null;
+        }
+
+        var pcmData = speech.AudioData;
+        if (!pcmData.IsCreated || pcmData.Length < 2)
+        {
+            Debug.LogWarning("[TalkingCube] Speech PCM data was empty.");
+            return null;
+        }
+
+        int sampleCount = pcmData.Length / 2;
+        float[] samples = new float[sampleCount];
+
+        for (int i = 0; i < sampleCount; i++)
+        {
+            int byteIndex = i * 2;
+            short pcmSample = (short)(pcmData[byteIndex] | (pcmData[byteIndex + 1] << 8));
+            samples[i] = pcmSample / 32768f;
+        }
+
+        int sampleRateHz = speech.SampleRate > 0 ? speech.SampleRate : 24000;
+        var clip = AudioClip.Create($"{speech.Name}_pcm", sampleCount, 1, sampleRateHz, false);
+        clip.SetData(samples, 0);
+        return clip;
     }
 
     // ── State + Visual Feedback (Part A) ──────────────────────────────────────

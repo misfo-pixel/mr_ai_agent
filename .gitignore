@@ -1,0 +1,52 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Auto-generated IDE / project files
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+*.apk
+*.aab
+*.symbols.zip
+TempAssembly.dll
+*BackUpThisFolder_ButDontShipItWithYourGame/
+*BurstDebugInformation_DoNotShip/
+mono_crash.*.blob
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+apikey
+apikey.txt
+*.apikey
+.env
+.env.*
+config.json
+secrets.json
+*.local

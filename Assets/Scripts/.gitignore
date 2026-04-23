@@ -1,0 +1,13 @@
+# Ignore API key files
+apikey
+apikey.txt
+*.apikey
+
+# Ignore environment/config files that may contain keys
+.env
+.env.*
+config.json
+secrets.json
+
+# Optional: ignore local config
+*.local
